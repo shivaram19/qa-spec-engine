@@ -1,0 +1,177 @@
+package com.example.e2e;
+
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
+import io.restassured.http.ContentType;
+import io.restassured.response.Response;
+import org.awaitility.Awaitility;
+import org.eclipse.microprofile.reactive.messaging.Channel;
+import org.eclipse.microprofile.reactive.messaging.Emitter;
+import io.smallrye.reactive.messaging.kafka.KafkaRecord;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.KafkaContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import javax.inject.Inject;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Generated E2E test.
+ *
+ * ID: {{ id }}
+ * Name: {{ name }}
+ * Labels: {{ labels | tojson }}
+ */
+@QuarkusTest
+@Testcontainers
+public class {{ testClassName }} {
+
+    {% if containers.requiresKafka %}
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(
+        DockerImageName.parse("confluentinc/cp-kafka:7.5.0")
+    ).withEmbeddedZookeeper();
+    {% endif %}
+
+    {% if containers.requiresPostgres %}
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
+        DockerImageName.parse("postgres:15-alpine")
+    ).withDatabaseName("testdb")
+     .withUsername("test")
+     .withPassword("test");
+    {% endif %}
+
+    {% if kafka and kafka.consume %}
+    private final List<String> consumedMessages = new ArrayList<>();
+
+    {% for c in kafka.consume %}
+    @Inject
+    @Channel("{{ c.topic }}")
+    io.smallrye.reactive.messaging.annotations.Blocking
+    public void onMessage_{{ loop.index }}(KafkaRecord<String, String> record) {
+        consumedMessages.add(record.getPayload());
+    }
+    {% endfor %}
+    {% endif %}
+
+    {% if kafka and kafka.produce %}
+    @Inject
+    @Channel("{{ kafka.produce[0].topic }}")
+    Emitter<String> emitter;
+    {% endif %}
+
+    @BeforeEach
+    public void beforeEach() {
+        {% if containers.requiresKafka %}
+        System.setProperty("kafka.bootstrap.servers", kafka.getBootstrapServers());
+        {% endif %}
+        {% if containers.requiresPostgres %}
+        System.setProperty("quarkus.datasource.jdbc.url", postgres.getJdbcUrl());
+        System.setProperty("quarkus.datasource.username", postgres.getUsername());
+        System.setProperty("quarkus.datasource.password", postgres.getPassword());
+        {% endif %}
+        {% for k, v in containers.properties.items() %}
+        System.setProperty("{{ k }}", "{{ v }}");
+        {% endfor %}
+
+        {% if kafka and kafka.consume %}
+        consumedMessages.clear();
+        {% endif %}
+    }
+
+    @AfterEach
+    public void afterEach() {
+        // no-op for now
+    }
+
+    @Test
+    public void {{ testMethodName }}() {
+        {% if http %}
+        // HTTP phase
+        RestAssured.baseURI = "{{ http.baseUrl }}";
+
+        Response response = given()
+            .contentType(ContentType.JSON)
+            {% if http.request.headers %}
+            {% for hk, hv in http.request.headers.items() %}
+            .header("{{ hk }}", "{{ hv }}")
+            {% endfor %}
+            {% endif %}
+            {% if http.request.body %}
+            .body({{ http.request.body | tojson }})
+            {% endif %}
+            .when()
+            .{{ http.request.method.lower() }}("{{ http.request.path }}")
+            .then()
+            .statusCode({{ http.expect.status }})
+            .extract()
+            .response();
+
+        {% if http.expect.jsonBody %}
+        // Basic JSON body assertions
+        {% for field, value in http.expect.jsonBody.items() %}
+        {% if value is string and value.startswith("{{ANY_") %}
+        assertNotNull(response.jsonPath().get("{{ field }}"), "Expected {{ field }} to be present");
+        {% elif value is string and value.startswith("{{CAPTURE:") %}
+        String {{ field }}Captured = response.jsonPath().getString("{{ field }}");
+        assertNotNull({{ field }}Captured, "Expected {{ field }} to be captured");
+        {% elif value is string and value.startswith("{{EQUALS_REF:") %}
+        // For MVP, treat EQUALS_REF like ANY and rely on later extensions
+        assertNotNull(response.jsonPath().get("{{ field }}"), "Expected {{ field }} to be present for ref compare");
+        {% elif value is string and value.startswith("{{EQUALS:") %}
+        assertEquals("{{ value.replace('{{EQUALS:', '').replace('}}', '') }}",
+                     response.jsonPath().getString("{{ field }}"),
+                     "Expected {{ field }} to match");
+        {% else %}
+        assertEquals({{ value | tojson }}, response.jsonPath().get("{{ field }}"));
+        {% endif %}
+        {% endfor %}
+        {% endif %}
+        {% endif %}
+
+        {% if kafka and kafka.produce %}
+        // Kafka produce phase
+        String payload = {{ kafka.produce[0].value | tojson }};
+        emitter.send(payload);
+        {% endif %}
+
+        {% if kafka and kafka.consume %}
+        // Kafka consume/verify phase
+        Awaitility.await()
+            .atMost({{ kafka.consume[0].timeoutSeconds }}, TimeUnit.SECONDS)
+            .pollInterval(Duration.ofMillis(500))
+            .untilAsserted(() -> assertFalse(consumedMessages.isEmpty(),
+                "Expected at least one message on topic {{ kafka.consume[0].topic }}"));
+
+        String consumed = consumedMessages.get(0);
+        assertNotNull(consumed, "Consumed message must not be null");
+
+        {% for field, value in kafka.consume[0].valueMatchers.items() %}
+        {% if value is string and value.startswith("{{ANY_") %}
+        assertTrue(consumed.contains("\"{{ field }}\""),
+            "Expected field {{ field }} to be present in message");
+        {% elif value is string and value.startswith("{{EQUALS:") %}
+        assertTrue(consumed.contains("\"{{ field }}\":\"{{ value.replace('{{EQUALS:', '').replace('}}', '') }}\""),
+            "Expected {{ field }} to equal specified value");
+        {% else %}
+        // Fallback string containment check for MVP
+        assertTrue(consumed.contains("\"{{ field }}\""),
+            "Expected field {{ field }} to be present (value check omitted)");
+        {% endif %}
+        {% endfor %}
+        {% endif %}
+    }
+}

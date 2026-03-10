@@ -1,0 +1,17 @@
+# Core LLM client
+openai>=1.6.0
+
+# Data validation & models
+pydantic>=2.7.0
+jsonschema>=4.23.0
+
+# Templating
+jinja2>=3.1.4
+
+# CLI and UX
+typer>=0.12.5
+rich>=13.8.0
+
+# Misc utilities
+pyyaml>=6.0.2
+python-dotenv>=1.0.1
